@@ -17,6 +17,32 @@ TRADING_MODE = os.getenv("TRADING_MODE", "paper")
 app = Flask(__name__)
 seen = set()
 
+# ==== PAPER TRADING SETTINGS ====
+START_BAL = float(os.getenv("START_BAL", "10"))        # fake $ per chain
+TRADE_FRACTION = float(os.getenv("TRADE_FRACTION", "0.5"))  # 50% of chain balance per trade
+TP_PCT = float(os.getenv("TP_PCT", "110"))             # take profit at +110%
+SL_PCT = float(os.getenv("SL_PCT", "90"))              # stop loss at -90%
+FEE_PCT = float(os.getenv("FEE_PCT", "2"))             # fake fees/slippage per round trip
+MAX_HOLD_HOURS = float(os.getenv("MAX_HOLD_HOURS", "24"))
+CHAINS = ["solana", "polygon", "bsc", "base", "ethereum"]
+STATE_FILE = "paper_state.json"
+lock = threading.Lock()
+
+state = {"balances": {c: START_BAL for c in CHAINS}, "positions": [], "closed": [], "last_summary": time.time()}
+try:
+    with open(STATE_FILE) as f:
+        state.update(json.load(f))
+except Exception:
+    pass
+
+
+def save_state():
+    try:
+        with open(STATE_FILE, "w") as f:
+            json.dump(state, f)
+    except Exception:
+        pass
+
 
 def send_whatsapp(text):
     # Sends the alert to the ntfy app (name kept so the rest of the code works)
@@ -93,6 +119,91 @@ def get_evm_50_percent():
         return 0
 
 
+def get_price(chain, pair_addr):
+    try:
+        r = requests.get(f"https://api.dexscreener.com/latest/dex/pairs/{chain}/{pair_addr}", timeout=10).json()
+        p = r.get("pair") or ((r.get("pairs") or [None])[0])
+        return float(p["priceUsd"]) if p else None
+    except Exception:
+        return None
+
+
+def paper_buy(pair):
+    chain = pair["chainId"]
+    symbol = pair["baseToken"]["symbol"]
+    price = float(pair["priceUsd"])
+    link = f"https://dexscreener.com/{chain}/{pair['pairAddress']}"
+    with lock:
+        bal = state["balances"].setdefault(chain, START_BAL)
+        size = bal * TRADE_FRACTION
+        if size < 0.5:
+            send_whatsapp(f"SKIPPED ${symbol} on {chain.upper()}: balance too low (${bal:.2f})")
+            return
+        state["balances"][chain] = bal - size
+        state["positions"].append({
+            "chain": chain, "symbol": symbol, "pair": pair["pairAddress"],
+            "entry": price, "size": size, "time": time.time(), "fails": 0})
+        save_state()
+    send_whatsapp(f"PAPER BUY ${symbol} on {chain.upper()}\nSize ${size:.2f} (50% of ${bal:.2f})\nEntry ${price}\nTP +{TP_PCT:.0f}% | SL -{SL_PCT:.0f}%\n{link}")
+
+
+def close_position(pos, exit_price, reason):
+    with lock:
+        if pos not in state["positions"]:
+            return
+        value = pos["size"] * (exit_price / pos["entry"]) * (1 - FEE_PCT / 100)
+        pnl = value - pos["size"]
+        pct = (value / pos["size"] - 1) * 100
+        state["balances"][pos["chain"]] = state["balances"].get(pos["chain"], 0) + value
+        state["positions"].remove(pos)
+        state["closed"].append({"symbol": pos["symbol"], "chain": pos["chain"], "pnl": pnl, "pct": pct, "reason": reason})
+        bal = state["balances"][pos["chain"]]
+        save_state()
+    send_whatsapp(f"PAPER SELL ${pos['symbol']} on {pos['chain'].upper()} ({reason})\n{pct:+.1f}% | PnL {pnl:+.2f} USD\n{pos['chain'].upper()} balance ${bal:.2f}")
+
+
+def summary_text():
+    with lock:
+        closed = list(state["closed"])
+        wins = sum(1 for c in closed if c["pnl"] > 0)
+        losses = len(closed) - wins
+        total = sum(c["pnl"] for c in closed)
+        lines = [f"SUMMARY: {len(closed)} trades, {wins} wins, {losses} losses", f"Total PnL {total:+.2f} USD"]
+        for ch, b in state["balances"].items():
+            lines.append(f"{ch.upper()}: ${b:.2f}")
+        lines.append(f"Open positions: {len(state['positions'])}")
+    return "\n".join(lines)
+
+
+def monitor():
+    while True:
+        try:
+            with lock:
+                open_pos = list(state["positions"])
+            for pos in open_pos:
+                price = get_price(pos["chain"], pos["pair"])
+                if price is None:
+                    pos["fails"] = pos.get("fails", 0) + 1
+                    if pos["fails"] >= 15:
+                        close_position(pos, pos["entry"] * 0.0001, "NO DATA / RUG")
+                    continue
+                pos["fails"] = 0
+                change = (price / pos["entry"] - 1) * 100
+                if change >= TP_PCT:
+                    close_position(pos, price, "TAKE PROFIT")
+                elif change <= -SL_PCT:
+                    close_position(pos, price, "STOP LOSS")
+                elif time.time() - pos["time"] > MAX_HOLD_HOURS * 3600:
+                    close_position(pos, price, "TIME EXIT")
+            if time.time() - state.get("last_summary", 0) > 24 * 3600:
+                state["last_summary"] = time.time()
+                send_whatsapp(summary_text())
+                save_state()
+        except Exception as e:
+            print("monitor error:", e)
+        time.sleep(20)
+
+
 def buy_token(pair):
     chain = pair['chainId']
     symbol = pair['baseToken']['symbol']
@@ -101,7 +212,7 @@ def buy_token(pair):
 
     # --- PAPER MODE ---
     if TRADING_MODE == "paper":
-        send_whatsapp(f"PAPER BUY ${symbol} on {chain.upper()}\nPrice ${price}\nTP +110% SL 90%\n{link}")
+        paper_buy(pair)
         return
 
     # --- REAL MODE (50% OF WALLET) ---
@@ -186,4 +297,5 @@ def home():
 if __name__ == "__main__":
     send_whatsapp(f"Bot started in {TRADING_MODE.upper()} mode")
     threading.Thread(target=scanner, daemon=True).start()
+    threading.Thread(target=monitor, daemon=True).start()
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "10000")))
