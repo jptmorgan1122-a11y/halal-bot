@@ -7,10 +7,11 @@ EVM_PRIVATE_KEY = os.getenv("EVM_PRIVATE_KEY", "0x372f9c7cbe15fa79365a10587b1372
 HELIUS_RPC = os.getenv("HELIUS_RPC", "https://mainnet.helius-rpc.com/?api-key=1942eb38-a995-4415-a5dd-00794df2676c")
 ALCHEMY_RPC = os.getenv("ALCHEMY_RPC", "https://rpc.ankr.com/polygon")
 GEMINI_KEY = os.getenv("GEMINI_KEY", "AIzaSyDLbT5Kt-GjHij2B12fgZaBPBLxCUb7NQg")
-WHATSAPP_TOKEN = os.getenv("WHATSAPP_TOKEN", "EAAP7755w8FwBS0ZBwVL1E3IxOEGbrqfUWIcZCxkMvEw6ym88AFXgSHRn2l3Ul3NmhoeK0iGC3TLNURYiPSuKhZCNXaoe4qyuJB92eO99KZBzBzM0VX6xrs9n9AZBe1zLbT364ZCpWfq7HTBpZBKmhrmkymJczX4iNerDvuJ5XcA4Ko3gmsYawqhzaQTaOZALIG1wF2vFMhrqTIhrZALhOh3w6UZC68sg5csR3Mtu7nZCZAKE13zpJolAMgZDZD" )
+WHATSAPP_TOKEN = os.getenv("WHATSAPP_TOKEN", "EAAP7755w8FwBSZB44MuMzJwKjHmNpxq0kaHccQb1oM5b68phjrf2ZBCRI9JlsV924cS6hmDohdd0bAejqK3PqYhqYH8hp5J6Ypa7BFEmgWVZCPkiumst3SIuvUin3hQZAIir4DxGbo6L6doEDx1MuRZA0ffq2svCZAJPfkyfKK1DPjDLVvvxbCDN6qDVFV1QDRe9Szh8u3yJuiqKYFWZAAQ9avq77pAX42WSrgEzsKHe3w8EP1jeQZDZD")
 PHONE_ID = os.getenv("PHONE_ID", "1401521863047276")
 VERIFY_TOKEN = os.getenv("VERIFY_TOKEN", "halalbot123")
 MY_NUMBER = os.getenv("MY_NUMBER", "923309355323")
+NTFY_TOPIC = os.getenv("NTFY_TOPIC", "halalbot-269e58ea7930")
 TRADING_MODE = os.getenv("TRADING_MODE", "paper")
 
 app = Flask(__name__)
@@ -18,11 +19,9 @@ seen = set()
 
 
 def send_whatsapp(text):
-    url = f"https://graph.facebook.com/v19.0/{PHONE_ID}/messages"
-    h = {"Authorization": f"Bearer {WHATSAPP_TOKEN}", "Content-Type": "application/json"}
-    data = {"messaging_product": "whatsapp", "to": MY_NUMBER, "type": "text", "text": {"body": text}}
+    # Sends the alert to the ntfy app (name kept so the rest of the code works)
     try:
-        requests.post(url, json=data, headers=h, timeout=10)
+        requests.post(f"https://ntfy.sh/{NTFY_TOPIC}", data=text.encode("utf-8"), timeout=10)
     except Exception:
         pass
 
@@ -185,5 +184,6 @@ def home():
 
 
 if __name__ == "__main__":
+    send_whatsapp(f"Bot started in {TRADING_MODE.upper()} mode")
     threading.Thread(target=scanner, daemon=True).start()
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "10000")))
