@@ -14,7 +14,7 @@
 ‎MY_NUMBER = "923309355323"
 ‎TRADING_MODE = os.getenv("TRADING_MODE", "paper")
 ‎
-‎app = Flask(name)
+‎app = Flask(__name__)
 ‎seen = set()
 ‎
 ‎def send_whatsapp(text):
