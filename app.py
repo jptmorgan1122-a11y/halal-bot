@@ -12,7 +12,7 @@ PHONE_ID = os.getenv("PHONE_ID", "1401521863047276")
 VERIFY_TOKEN = os.getenv("VERIFY_TOKEN", "halalbot123")
 MY_NUMBER = os.getenv("MY_NUMBER", "923309355323")
 NTFY_TOPIC = os.getenv("NTFY_TOPIC", "halalbot-269e58ea7930")
-TRADING_MODE = os.getenv("TRADING_MODE", "real")
+TRADING_MODE = os.getenv("TRADING_MODE", "paper")
 
 app = Flask(__name__)
 seen = set()
