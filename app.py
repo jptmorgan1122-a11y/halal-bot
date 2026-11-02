@@ -16,6 +16,11 @@ TRADING_MODE = os.getenv("TRADING_MODE", "paper")
 
 app = Flask(__name__)
 seen = set()
+MAX_AGE_SEC = float(os.getenv("MAX_AGE_SEC", "600"))    # pair must be younger than 10 min
+BUY_START_SEC = float(os.getenv("BUY_START_SEC", "570"))  # buy in last 30s of the 2nd 5-min candle (570-600s)
+watchlist = {}  # pairAddress -> pair that passed all checks, waiting for the buy window
+stats = {"scanned": 0, "pumpfun": 0, "too_old": 0, "no_website": 0, "no_logo": 0, "low_liq": 0,
+         "multi_pair": 0, "gemini_error": 0, "missed_window": 0, "haram_or_unclear": 0, "bought": 0}
 
 # ==== PAPER TRADING SETTINGS ====
 START_BAL = float(os.getenv("START_BAL", "10"))        # fake $ per chain
@@ -45,18 +50,28 @@ def save_state():
 
 
 def send_whatsapp(text):
-    # Sends the alert to the ntfy app (name kept so the rest of the code works)
-    try:
-        requests.post(f"https://ntfy.sh/{NTFY_TOPIC}", data=text.encode("utf-8"), timeout=10)
-    except Exception:
-        pass
-
-
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
-
-HALAL_PROMPT = ("The data I provide to you . Does it have anything Haram mentioned in the writing only . "
-                "Consider Lack of purpose is also haram. don't talk about uncertainty or gahar etc ? "
-                "One word ans only . YES OR NO no bullshit only one word ans")
+    # Sends alerts to Pushbullet (if PUSHBULLET_TOKEN is set) and to ntfy, and logs the result
+    token = os.getenv("PUSHBULLET_TOKEN", "")
+    if token:
+        try:
+            r = requests.post("https://api.pushbullet.com/v2/pushes", headers={"Access-Token": token},
+                              json={"type": "note", "title": "Halal Bot", "body": text}, timeout=10)
+            print("pushbullet status:", r.status_code, r.text[:100])
+        except Exception as e:
+            print("pushbullet error:", e)
+    headers = {"Title": "Halal Bot"}
+    ntfy_token = os.getenv("NTFY_TOKEN", "")
+    if ntfy_token:
+        headers["Authorization"] = f"Bearer {ntfy_token}"
+    for attempt in range(3):
+        try:
+            r = requests.post(f"https://ntfy.sh/{NTFY_TOPIC}", data=text.encode("utf-8"), headers=headers, timeout=15)
+            print("ntfy status:", r.status_code, r.text[:100])
+            if r.status_code == 200:
+                break
+        except Exception as e:
+            print("ntfy error:", e)
+        time.sleep(3)
 
 
 def is_halal(name, desc, website):
@@ -70,6 +85,7 @@ def is_halal(name, desc, website):
         return word == "NO"
     except Exception as e:
         print("halal check error:", e)
+        stats["gemini_error"] += 1
         return False
 
 
@@ -79,25 +95,32 @@ def is_pumpfun(pair):
 
 
 def check_all_rules(pair):
+    stats["scanned"] += 1
     if is_pumpfun(pair):
+        stats["pumpfun"] += 1
         return False, ""
     created_ms = pair.get('pairCreatedAt', 0)
-    if not created_ms or time.time() - created_ms / 1000 > 120:
+    if not created_ms or time.time() - created_ms / 1000 > MAX_AGE_SEC:
+        stats["too_old"] += 1
         return False, ""
     info = pair.get('info', {})
     webs = info.get('websites', [])
     if not webs:
+        stats["no_website"] += 1
         return False, ""
     website = webs[0].get('url', '')
     if not info.get('imageUrl'):
+        stats["no_logo"] += 1
         return False, ""
     liq = pair.get('liquidity', {}).get('usd', 0)
     if liq < 1000:
+        stats["low_liq"] += 1
         return False, ""
     token_addr = pair['baseToken']['address']
     try:
         res = requests.get(f"https://api.dexscreener.com/latest/dex/tokens/{token_addr}", timeout=10).json()
         if len(res.get('pairs', [])) > 1:
+            stats["multi_pair"] += 1
             return False, ""
     except Exception:
         pass
@@ -397,97 +420,4 @@ def monitor():
                     continue
                 pos["fails"] = 0
                 change = (price / pos["entry"] - 1) * 100
-                if change >= TP_PCT:
-                    close_any(pos, price, "TAKE PROFIT")
-                elif change <= -SL_PCT:
-                    close_any(pos, price, "STOP LOSS")
-                elif time.time() - pos["time"] > MAX_HOLD_HOURS * 3600:
-                    close_any(pos, price, "TIME EXIT")
-            if time.time() - state.get("last_summary", 0) > 24 * 3600:
-                state["last_summary"] = time.time()
-                send_whatsapp(summary_text())
-                save_state()
-        except Exception as e:
-            print("monitor error:", e)
-        time.sleep(20)
-
-
-def buy_token(pair):
-    chain = pair['chainId']
-    symbol = pair['baseToken']['symbol']
-    price = float(pair['priceUsd'])
-    link = f"https://dexscreener.com/{chain}/{pair['pairAddress']}"
-
-    # --- PAPER MODE ---
-    if TRADING_MODE == "paper":
-        paper_buy(pair)
-        return
-
-    # --- REAL MODE ---
-    real_buy(pair)
-
-
-def handle_pair(pair):
-    if pair['pairAddress'] in seen:
-        return
-    seen.add(pair['pairAddress'])
-    ok, website = check_all_rules(pair)
-    if not ok:
-        return
-    symbol = pair['baseToken']['symbol']
-    desc = pair.get('info', {}).get('header', '') or pair['baseToken']['name']
-    if not is_halal(symbol, desc, website):
-        return
-    buy_token(pair)
-
-
-def scanner():
-    while True:
-        try:
-            for q in ['solana', 'polygon', 'bsc', 'base', 'ethereum']:
-                try:
-                    r = requests.get(f"https://api.dexscreener.com/latest/dex/search/?q={q}", timeout=15).json()
-                    for pair in r.get('pairs', [])[:15]:
-                        handle_pair(pair)
-                except Exception:
-                    continue
-            time.sleep(5)
-        except Exception:
-            time.sleep(5)
-
-
-@app.route("/webhook", methods=["GET", "POST"])
-def webhook():
-    global TRADING_MODE
-    if request.method == "GET":
-        if request.args.get("hub.verify_token") == VERIFY_TOKEN:
-            return request.args.get("hub.challenge")
-        return "forbidden", 403
-    try:
-        data = request.json
-        m = data['entry'][0]['changes'][0]['value']['messages'][0]
-        # Only accept commands from your own number
-        if m.get('from') != MY_NUMBER:
-            return "ok", 200
-        msg = m['text']['body'].lower().strip()
-        if msg == "paper":
-            TRADING_MODE = "paper"
-            send_whatsapp("Switched to PAPER (no real money)")
-        elif msg == "real":
-            TRADING_MODE = "real"
-            send_whatsapp("Switched to REAL (50% wallet per trade!)")
-    except Exception:
-        pass
-    return "ok", 200
-
-
-@app.route("/")
-def home():
-    return f"Bot LIVE {TRADING_MODE.upper()} - REAL uses 50%"
-
-
-if __name__ == "__main__":
-    send_whatsapp(f"Bot started in {TRADING_MODE.upper()} mode")
-    threading.Thread(target=scanner, daemon=True).start()
-    threading.Thread(target=monitor, daemon=True).start()
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "10000")))
+              
