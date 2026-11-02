@@ -1,4 +1,2 @@
-Flask
+flask
 requests
-solders
-eth_account
