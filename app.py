@@ -1,4 +1,3 @@
-
 import os, time, json, threading, requests
 from flask import Flask
 
@@ -16,6 +15,7 @@ FEE_PCT = float(os.getenv("FEE_PCT", "2"))          # fake fees/slippage per rou
 MAX_AGE_SEC = float(os.getenv("MAX_AGE_SEC", "120"))  # pair must be younger than this
 MIN_LIQ_USD = float(os.getenv("MIN_LIQ_USD", "1000"))
 MAX_HOLD_HOURS = float(os.getenv("MAX_HOLD_HOURS", "24"))
+SCAN_PAUSE = float(os.getenv("SCAN_PAUSE", "15"))  # seconds between scan rounds
 
 CHAINS = ["solana", "polygon", "bsc", "base", "ethereum"]
 STATE_FILE = "paper_state.json"
@@ -51,6 +51,13 @@ def save_state():
         pass
 
 
+def get_json(url, timeout=15):
+    r = requests.get(url, timeout=timeout, headers={"User-Agent": "Mozilla/5.0"})
+    if r.status_code != 200:
+        raise Exception(f"HTTP {r.status_code} from {url.split('?')[0]}: {r.text[:80]}")
+    return r.json()
+
+
 # ================= ALERTS (ntfy) =================
 def notify(text):
     headers = {"Title": "Halal Bot"}
@@ -59,9 +66,9 @@ def notify(text):
     for _ in range(3):
         try:
             r = requests.post(f"https://ntfy.sh/{NTFY_TOPIC}", data=text.encode("utf-8"), headers=headers, timeout=15)
-            log("ntfy status:", r.status_code, r.text[:80])
-            if r.status_code == 200:
-                return
+            log("ntfy status:", r.status_code, r.text[:200])
+            if r.status_code == 200 or r.status_code == 429:
+                return  # 429 = quota reached, retrying won't help (set NTFY_TOKEN)
         except Exception as e:
             log("ntfy error:", e)
         time.sleep(3)
@@ -103,7 +110,7 @@ def check_rules(pair):
         stats["low_liq"] += 1
         return False, ""
     try:
-        res = requests.get(f"https://api.dexscreener.com/latest/dex/tokens/{pair['baseToken']['address']}", timeout=10).json()
+        res = get_json(f"https://api.dexscreener.com/latest/dex/tokens/{pair['baseToken']['address']}", 10)
         if len(res.get("pairs") or []) > 1:
             stats["multi_pair"] += 1
             return False, ""
@@ -151,7 +158,7 @@ def paper_sell(pos, exit_price, reason):
 
 def get_price(chain, pair_addr):
     try:
-        r = requests.get(f"https://api.dexscreener.com/latest/dex/pairs/{chain}/{pair_addr}", timeout=10).json()
+        r = get_json(f"https://api.dexscreener.com/latest/dex/pairs/{chain}/{pair_addr}", 10)
         p = r.get("pair") or ((r.get("pairs") or [None])[0])
         return float(p["priceUsd"]) if p else None
     except Exception:
@@ -217,29 +224,34 @@ def handle_pair(pair):
 
 
 def scanner():
+    seen_tokens = set()
     while True:
         try:
             for q in CHAINS:
                 try:
-                    r = requests.get(f"https://api.dexscreener.com/latest/dex/search/?q={q}", timeout=15).json()
+                    r = get_json(f"https://api.dexscreener.com/latest/dex/search/?q={q}")
                     for pair in (r.get("pairs") or [])[:15]:
                         handle_pair(pair)
                 except Exception as e:
                     log("search error:", e)
+                time.sleep(1)
             try:
-                prof = requests.get("https://api.dexscreener.com/token-profiles/latest/v1", timeout=15).json()
+                prof = get_json("https://api.dexscreener.com/token-profiles/latest/v1")
                 for p in prof[:30]:
-                    if p.get("chainId") not in CHAINS:
+                    addr = p.get("tokenAddress")
+                    if p.get("chainId") not in CHAINS or not addr or addr in seen_tokens:
                         continue
-                    res = requests.get(f"https://api.dexscreener.com/latest/dex/tokens/{p['tokenAddress']}", timeout=10).json()
+                    seen_tokens.add(addr)
+                    res = get_json(f"https://api.dexscreener.com/latest/dex/tokens/{addr}", 10)
                     pairs = res.get("pairs") or []
                     if pairs:
                         handle_pair(pairs[0])
+                    time.sleep(0.5)
             except Exception as e:
                 log("profiles error:", e)
         except Exception as e:
             log("scanner error:", e)
-        time.sleep(5)
+        time.sleep(SCAN_PAUSE)
 
 
 # ================= WEB PAGE (also keeps Render awake via UptimeRobot) =================
@@ -262,3 +274,4 @@ if __name__ == "__main__":
     threading.Thread(target=scanner, daemon=True).start()
     threading.Thread(target=monitor, daemon=True).start()
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "10000")))
+                              
