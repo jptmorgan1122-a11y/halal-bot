@@ -15,6 +15,7 @@ FEE_PCT = float(os.getenv("FEE_PCT", "2"))          # fake fees/slippage per rou
 MAX_AGE_SEC = float(os.getenv("MAX_AGE_SEC", "120"))  # pair must be younger than this
 MIN_LIQ_USD = float(os.getenv("MIN_LIQ_USD", "1000"))
 MAX_HOLD_HOURS = float(os.getenv("MAX_HOLD_HOURS", "24"))
+COOLDOWN_SEC = float(os.getenv("COOLDOWN_SEC", "90"))  # pause after a 429
 SCAN_PAUSE = float(os.getenv("SCAN_PAUSE", "15"))  # seconds between scan rounds
 
 CHAINS = ["solana", "polygon", "bsc", "base", "ethereum"]
@@ -51,10 +52,19 @@ def save_state():
         pass
 
 
+cooldown_until = 0  # set when DexScreener answers HTTP 429
+
+
 def get_json(url, timeout=15):
+    global cooldown_until
+    if time.time() < cooldown_until:
+        raise Exception("cooling down after HTTP 429")
     r = requests.get(url, timeout=timeout, headers={"User-Agent": "Mozilla/5.0"})
+    if r.status_code == 429:
+        cooldown_until = time.time() + COOLDOWN_SEC
+        raise Exception(f"HTTP 429 (blocked/rate limited), pausing {COOLDOWN_SEC:.0f}s")
     if r.status_code != 200:
-        raise Exception(f"HTTP {r.status_code} from {url.split('?')[0]}: {r.text[:80]}")
+        raise Exception(f"HTTP {r.status_code} from {url.split('?')[0]}")
     return r.json()
 
 
@@ -158,8 +168,13 @@ def paper_sell(pos, exit_price, reason):
 
 
 def get_price(chain, pair_addr):
+    # returns a price, None if the pair truly has no data, or "ERR" if the request itself failed
     try:
         r = get_json(f"https://api.dexscreener.com/latest/dex/pairs/{chain}/{pair_addr}", 10)
+    except Exception as e:
+        log("price error:", e)
+        return "ERR"
+    try:
         p = r.get("pair") or ((r.get("pairs") or [None])[0])
         return float(p["priceUsd"]) if p else None
     except Exception:
@@ -184,6 +199,8 @@ def monitor():
                 open_pos = list(state["positions"])
             for pos in open_pos:
                 price = get_price(pos["chain"], pos["pair"])
+                if price == "ERR":
+                    continue
                 if price is None:
                     pos["fails"] = pos.get("fails", 0) + 1
                     if pos["fails"] >= 15:
@@ -227,8 +244,13 @@ def handle_pair(pair):
 def scanner():
     seen_tokens = set()
     while True:
+        if time.time() < cooldown_until:
+            time.sleep(5)
+            continue
         try:
             for q in CHAINS:
+                if time.time() < cooldown_until:
+                    break
                 try:
                     r = get_json(f"https://api.dexscreener.com/latest/dex/search/?q={q}")
                     for pair in (r.get("pairs") or [])[:15]:
