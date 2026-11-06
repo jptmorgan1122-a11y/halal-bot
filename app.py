@@ -60,6 +60,7 @@ def get_json(url, timeout=15):
 
 # ================= ALERTS (ntfy) =================
 def notify(text):
+    log("ALERT:", text.replace("\n", " | "))
     headers = {"Title": "Halal Bot"}
     if NTFY_TOKEN:
         headers["Authorization"] = f"Bearer {NTFY_TOKEN}"
@@ -260,6 +261,15 @@ def home():
     lines = [f"Bot LIVE PAPER - max pair age {MAX_AGE_SEC:.0f}s"]
     lines += [f"{k}: {v}" for k, v in stats.items()]
     lines.append(f"open positions: {len(state['positions'])}")
+    lines.append("")
+    lines.append(summary_text())
+    lines.append("")
+    lines.append("open trades:")
+    for p in state["positions"]:
+        lines.append(f"  {p['symbol']} on {p['chain']} entry {p['entry']} size ${p['size']:.2f}")
+    lines.append("last 10 closed trades:")
+    for c in state["closed"][-10:]:
+        lines.append(f"  {c['symbol']} {c['chain']} {c['reason']} {c['pct']:+.1f}% ({c['pnl']:+.2f} USD)")
     return "<pre>" + "\n".join(lines) + "</pre>"
 
 
@@ -274,4 +284,4 @@ if __name__ == "__main__":
     threading.Thread(target=scanner, daemon=True).start()
     threading.Thread(target=monitor, daemon=True).start()
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "10000")))
-                              
+      
