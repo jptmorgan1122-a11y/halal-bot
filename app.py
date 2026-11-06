@@ -20,7 +20,7 @@ AUDIT_ON = os.getenv("AUDIT_ON", "1") == "1"                 # set AUDIT_ON=0 to
 AUDIT_ON_ERROR = os.getenv("AUDIT_ON_ERROR", "skip")          # "skip" = don't buy if audit can't be checked, "allow" = buy anyway
 MAX_TAX_PCT = float(os.getenv("MAX_TAX_PCT", "10"))           # EVM buy/sell tax limit
 GOPLUS_CHAIN_IDS = {"ethereum": "1", "bsc": "56", "polygon": "137", "base": "8453"}
-SCAN_PAUSE = float(os.getenv("SCAN_PAUSE", "15"))  # seconds between scan rounds
+SCAN_PAUSE = float(os.getenv("SCAN_PAUSE", "2"))  # seconds between scan rounds
 
 CHAINS = ["solana", "polygon", "bsc", "base", "ethereum"]
 STATE_FILE = "paper_state.json"
@@ -56,20 +56,57 @@ def save_state():
         pass
 
 
-cooldown_until = 0  # set when DexScreener answers HTTP 429
+cooldown_until = 0  # set when the data API answers HTTP 429
+GECKO = "https://api.geckoterminal.com/api/v2"
+GECKO_NET = {"solana": "solana", "polygon": "polygon_pos", "bsc": "bsc", "base": "base", "ethereum": "eth"}
+GECKO_PER_MIN = int(os.getenv("GECKO_PER_MIN", "26"))   # free limit is about 30 calls/min
+_calls = []
+_rate_lock = threading.Lock()
 
 
-def get_json(url, timeout=15):
+def gecko_json(path, timeout=15):
+    """GeckoTerminal GET with a built-in rate limiter. Returns None on 404, raises on other errors."""
     global cooldown_until
     if time.time() < cooldown_until:
         raise Exception("cooling down after HTTP 429")
-    r = requests.get(url, timeout=timeout, headers={"User-Agent": "Mozilla/5.0"})
+    with _rate_lock:
+        now = time.time()
+        while _calls and now - _calls[0] > 60:
+            _calls.pop(0)
+        if len(_calls) >= GECKO_PER_MIN:
+            time.sleep(max(0.0, 60 - (now - _calls[0]) + 0.2))
+        _calls.append(time.time())
+    r = requests.get(GECKO + path, headers={"Accept": "application/json;version=20230302"}, timeout=timeout)
+    if r.status_code == 404:
+        return None
     if r.status_code == 429:
         cooldown_until = time.time() + COOLDOWN_SEC
-        raise Exception(f"HTTP 429 (blocked/rate limited), pausing {COOLDOWN_SEC:.0f}s")
+        raise Exception(f"HTTP 429 (rate limited), pausing {COOLDOWN_SEC:.0f}s")
     if r.status_code != 200:
-        raise Exception(f"HTTP {r.status_code} from {url.split('?')[0]}")
+        raise Exception(f"HTTP {r.status_code} from {path.split('?')[0]}")
     return r.json()
+
+
+def iso_to_ms(t):
+    try:
+        import datetime
+        return datetime.datetime.fromisoformat(t.replace("Z", "+00:00")).timestamp() * 1000
+    except Exception:
+        return 0
+
+
+def pool_to_pair(chain, pool):
+    a = pool.get("attributes", {})
+    rel = pool.get("relationships", {})
+    base_id = rel["base_token"]["data"]["id"]          # e.g. "solana_<mint>"
+    token = base_id.split("_", 1)[1]
+    symbol = (a.get("name") or "").split(" / ")[0] or "?"
+    dex = rel.get("dex", {}).get("data", {}).get("id", "")
+    return {"chainId": chain, "pairAddress": a.get("address", ""), "dexId": dex.replace("-", "").lower(),
+            "pairCreatedAt": iso_to_ms(a.get("pool_created_at", "")),
+            "priceUsd": a.get("base_token_price_usd"),
+            "liquidity": {"usd": float(a.get("reserve_in_usd") or 0)},
+            "baseToken": {"address": token, "symbol": symbol, "name": symbol}}
 
 
 # ================= ALERTS (ntfy) =================
@@ -106,32 +143,42 @@ def is_halal(name, desc, website):
 # ================= FILTERS =================
 def check_rules(pair):
     stats["scanned"] += 1
-    if str(pair.get("dexId", "")).lower() == "pumpfun":   # block pump.fun bonding curve, allow pumpswap
+    if pair["dexId"] == "pumpfun":   # block pump.fun bonding curve, allow pumpswap
         stats["pumpfun"] += 1
         return False, ""
     created = pair.get("pairCreatedAt", 0)
     if not created or time.time() - created / 1000 > MAX_AGE_SEC:
         stats["too_old"] += 1
         return False, ""
-    info = pair.get("info") or {}
-    webs = info.get("websites") or []
+    if (pair.get("liquidity") or {}).get("usd", 0) < MIN_LIQ_USD or not pair.get("priceUsd"):
+        stats["low_liq"] += 1
+        return False, ""
+    net = GECKO_NET.get(pair["chainId"])
+    token = pair["baseToken"]["address"]
+    try:
+        info = (gecko_json(f"/networks/{net}/tokens/{token}/info") or {}).get("data", {}).get("attributes", {})
+    except Exception as e:
+        log("info error:", e)
+        return False, ""
+    webs = [w for w in (info.get("websites") or []) if w]
     if not webs:
         stats["no_website"] += 1
         return False, ""
-    if not info.get("imageUrl"):
+    img = info.get("image_url") or ""
+    if not img or "missing" in img:
         stats["no_logo"] += 1
         return False, ""
-    if (pair.get("liquidity") or {}).get("usd", 0) < MIN_LIQ_USD:
-        stats["low_liq"] += 1
-        return False, ""
     try:
-        res = get_json(f"https://api.dexscreener.com/latest/dex/tokens/{pair['baseToken']['address']}", 10)
-        if len(res.get("pairs") or []) > 1:
+        pools = (gecko_json(f"/networks/{net}/tokens/{token}/pools") or {}).get("data", [])
+        if len(pools) > 1:
             stats["multi_pair"] += 1
             return False, ""
     except Exception:
         pass
-    return True, webs[0].get("url", "")
+    pair["baseToken"]["name"] = info.get("name") or pair["baseToken"]["name"]
+    pair["baseToken"]["symbol"] = info.get("symbol") or pair["baseToken"]["symbol"]
+    pair["info"] = {"websites": [{"url": w} for w in webs], "imageUrl": img, "header": info.get("description") or ""}
+    return True, webs[0]
 
 
 # ================= AUDIT (RugCheck for Solana, GoPlus for EVM) =================
@@ -214,15 +261,14 @@ def paper_sell(pos, exit_price, reason):
 
 
 def get_price(chain, pair_addr):
-    # returns a price, None if the pair truly has no data, or "ERR" if the request itself failed
+    # returns a price, None if the pool truly has no data, or "ERR" if the request itself failed
     try:
-        r = get_json(f"https://api.dexscreener.com/latest/dex/pairs/{chain}/{pair_addr}", 10)
+        r = gecko_json(f"/networks/{GECKO_NET[chain]}/pools/{pair_addr}", 10)
     except Exception as e:
         log("price error:", e)
         return "ERR"
     try:
-        p = r.get("pair") or ((r.get("pairs") or [None])[0])
-        return float(p["priceUsd"]) if p else None
+        return float(r["data"]["attributes"]["base_token_price_usd"]) if r else None
     except Exception:
         return None
 
@@ -299,38 +345,22 @@ def handle_pair(pair):
 
 
 def scanner():
-    seen_tokens = set()
     while True:
         if time.time() < cooldown_until:
             time.sleep(5)
             continue
-        try:
-            for q in CHAINS:
-                if time.time() < cooldown_until:
-                    break
-                try:
-                    r = get_json(f"https://api.dexscreener.com/latest/dex/search/?q={q}")
-                    for pair in (r.get("pairs") or [])[:15]:
-                        handle_pair(pair)
-                except Exception as e:
-                    log("search error:", e)
-                time.sleep(1)
+        for chain in CHAINS:
+            if time.time() < cooldown_until:
+                break
             try:
-                prof = get_json("https://api.dexscreener.com/token-profiles/latest/v1")
-                for p in prof[:30]:
-                    addr = p.get("tokenAddress")
-                    if p.get("chainId") not in CHAINS or not addr or addr in seen_tokens:
-                        continue
-                    seen_tokens.add(addr)
-                    res = get_json(f"https://api.dexscreener.com/latest/dex/tokens/{addr}", 10)
-                    pairs = res.get("pairs") or []
-                    if pairs:
-                        handle_pair(pairs[0])
-                    time.sleep(0.5)
+                r = gecko_json(f"/networks/{GECKO_NET[chain]}/new_pools?page=1") or {}
+                for pool in r.get("data", []):
+                    try:
+                        handle_pair(pool_to_pair(chain, pool))
+                    except Exception as e:
+                        log("pool error:", e)
             except Exception as e:
-                log("profiles error:", e)
-        except Exception as e:
-            log("scanner error:", e)
+                log("scan error:", chain, e)
         time.sleep(SCAN_PAUSE)
 
 
@@ -363,4 +393,4 @@ if __name__ == "__main__":
     threading.Thread(target=scanner, daemon=True).start()
     threading.Thread(target=monitor, daemon=True).start()
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "10000")))
-      
+                                                                              
