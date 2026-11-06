@@ -16,6 +16,10 @@ MAX_AGE_SEC = float(os.getenv("MAX_AGE_SEC", "120"))  # pair must be younger tha
 MIN_LIQ_USD = float(os.getenv("MIN_LIQ_USD", "1000"))
 MAX_HOLD_HOURS = float(os.getenv("MAX_HOLD_HOURS", "24"))
 COOLDOWN_SEC = float(os.getenv("COOLDOWN_SEC", "90"))  # pause after a 429
+AUDIT_ON = os.getenv("AUDIT_ON", "1") == "1"                 # set AUDIT_ON=0 to disable audit checks
+AUDIT_ON_ERROR = os.getenv("AUDIT_ON_ERROR", "skip")          # "skip" = don't buy if audit can't be checked, "allow" = buy anyway
+MAX_TAX_PCT = float(os.getenv("MAX_TAX_PCT", "10"))           # EVM buy/sell tax limit
+GOPLUS_CHAIN_IDS = {"ethereum": "1", "bsc": "56", "polygon": "137", "base": "8453"}
 SCAN_PAUSE = float(os.getenv("SCAN_PAUSE", "15"))  # seconds between scan rounds
 
 CHAINS = ["solana", "polygon", "bsc", "base", "ethereum"]
@@ -30,7 +34,7 @@ app = Flask(__name__)
 lock = threading.Lock()
 seen = set()
 stats = {"scanned": 0, "pumpfun": 0, "too_old": 0, "no_website": 0, "no_logo": 0, "low_liq": 0,
-         "multi_pair": 0, "gemini_error": 0, "haram_or_unclear": 0, "bought": 0}
+         "multi_pair": 0, "audit_fail": 0, "audit_error": 0, "gemini_error": 0, "haram_or_unclear": 0, "bought": 0}
 state = {"balances": {c: START_BAL for c in CHAINS}, "positions": [], "closed": [], "last_summary": time.time()}
 
 try:
@@ -128,6 +132,48 @@ def check_rules(pair):
     except Exception:
         pass
     return True, webs[0].get("url", "")
+
+
+# ================= AUDIT (RugCheck for Solana, GoPlus for EVM) =================
+def audit_check(pair):
+    """returns (True, '') if clean, (False, reason) if risky, (None, reason) if it could not be checked"""
+    chain = pair["chainId"]
+    token = pair["baseToken"]["address"]
+    try:
+        if chain == "solana":
+            r = requests.get(f"https://api.rugcheck.xyz/v1/tokens/{token}/report/summary", timeout=15)
+            if r.status_code != 200:
+                return None, f"rugcheck HTTP {r.status_code}"
+            data = r.json()
+            danger = [x.get("name", "?") for x in (data.get("risks") or []) if str(x.get("level", "")).lower() == "danger"]
+            if danger:
+                return False, "RugCheck danger: " + ", ".join(danger[:3])
+            return True, ""
+        cid = GOPLUS_CHAIN_IDS.get(chain)
+        if not cid:
+            return None, "chain not supported for audit"
+        r = requests.get(f"https://api.gopluslabs.io/api/v1/token_security/{cid}?contract_addresses={token}", timeout=15)
+        if r.status_code != 200:
+            return None, f"goplus HTTP {r.status_code}"
+        res = (r.json().get("result") or {}).get(token.lower())
+        if not res:
+            return None, "goplus has no data yet"
+        bad = []
+        for key, label in [("is_honeypot", "honeypot"), ("cannot_sell_all", "cannot sell all"), ("hidden_owner", "hidden owner"),
+                           ("is_mintable", "mintable"), ("transfer_pausable", "pausable"), ("can_take_back_ownership", "ownership takeback")]:
+            if str(res.get(key, "0")) == "1":
+                bad.append(label)
+        if str(res.get("is_open_source", "1")) == "0":
+            bad.append("not open source")
+        for key in ("buy_tax", "sell_tax"):
+            try:
+                if float(res.get(key) or 0) * 100 > MAX_TAX_PCT:
+                    bad.append(f"{key} {float(res[key]) * 100:.0f}%")
+            except Exception:
+                pass
+        return (False, "GoPlus: " + ", ".join(bad)) if bad else (True, "")
+    except Exception as e:
+        return None, f"audit error: {e}"
 
 
 # ================= PAPER TRADING =================
@@ -232,6 +278,17 @@ def handle_pair(pair):
     ok, website = check_rules(pair)
     if not ok:
         return
+    if AUDIT_ON:
+        ok_audit, why = audit_check(pair)
+        if ok_audit is False:
+            stats["audit_fail"] += 1
+            log("AUDIT FAIL:", pair["baseToken"].get("symbol"), why)
+            return
+        if ok_audit is None:
+            stats["audit_error"] += 1
+            log("AUDIT UNKNOWN:", pair["baseToken"].get("symbol"), why)
+            if AUDIT_ON_ERROR != "allow":
+                return
     name = pair["baseToken"].get("name", "")
     symbol = pair["baseToken"].get("symbol", "")
     desc = (pair.get("info") or {}).get("header", "") or name
